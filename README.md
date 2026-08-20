@@ -8,6 +8,7 @@ Alpine container images built on the official images, published daily, across tw
 - The daily schedule checks whether Alpine has published a new version before rebuilding — a run only republishes if the resolved version differs from what's already in GHCR. Push and manual dispatch always rebuild, since those are explicit requests a version check wouldn't catch (e.g. after editing a Dockerfile)
 - The build matrix for each variant is resolved from `alpine:<variant>`'s upstream manifest at run time rather than hardcoded — see [Platforms](#platforms)
 - Each image carries an `org.opencontainers.image.version` label set to the underlying Alpine version (e.g. `3.24.1`, visible via `docker inspect`)
+- Version-based tags use the Alpine version itself for `latest` (e.g. `3.24.1`) and the upstream snapshot date for `edge` (e.g. `20260805`, extracted from the `_alphaYYYYMMDD` suffix in Alpine's `VERSION_ID`), matching the convention used by the official `alpine` image
 
 ## Images
 
@@ -55,11 +56,15 @@ Each variant builds whatever platforms Docker Hub currently publishes for `alpin
 | Tag pattern | Description |
 |-------------|-------------|
 | `latest` | `latest` base image |
+| `<alpine version>` | `latest` base image, stamped with the underlying Alpine version (e.g. `3.24.1`) |
 | `python` | `latest` Python image |
+| `<alpine version>-python` | `latest` Python image, stamped with the underlying Alpine version |
 | `uv` | `latest` uv image |
 | `uv-<uv version>` | `latest` uv image, stamped with the bundled uv release (e.g. `uv-0.11.32`) |
 | `edge` | `edge` base image |
+| `<snapshot date>` | `edge` base image, stamped with the upstream snapshot date embedded in Alpine's edge version (e.g. `20260805`), same as the official `alpine` image |
 | `edge-python` | `edge` Python image |
+| `<snapshot date>-edge-python` | `edge` Python image, stamped with the upstream snapshot date |
 | `edge-uv` | `edge` uv image |
 | `edge-uv-<uv version>` | `edge` uv image, stamped with the bundled uv release |
 

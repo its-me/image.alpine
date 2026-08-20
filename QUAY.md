@@ -42,11 +42,15 @@ Each variant builds whatever platforms Docker Hub currently publishes for `alpin
 | Tag pattern | Description |
 |-------------|-------------|
 | `latest` | `latest` base image |
+| `<alpine version>` | `latest` base image, stamped with the underlying Alpine version (e.g. `3.24.1`) |
 | `python` | `latest` Python image |
+| `<alpine version>-python` | `latest` Python image, stamped with the underlying Alpine version |
 | `uv` | `latest` uv image |
 | `uv-<uv version>` | `latest` uv image, stamped with the bundled uv release (e.g. `uv-0.11.32`) |
 | `edge` | `edge` base image |
+| `<snapshot date>` | `edge` base image, stamped with the upstream snapshot date embedded in Alpine's edge version (e.g. `20260805`), same as the official `alpine` image |
 | `edge-python` | `edge` Python image |
+| `<snapshot date>-edge-python` | `edge` Python image, stamped with the upstream snapshot date |
 | `edge-uv` | `edge` uv image |
 | `edge-uv-<uv version>` | `edge` uv image, stamped with the bundled uv release |
 

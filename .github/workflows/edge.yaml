@@ -21,6 +21,7 @@ jobs:
       packages: read
     outputs:
       version: ${{ steps.version.outputs.value }}
+      tag_version: ${{ steps.version.outputs.tag_value }}
       changed: ${{ steps.check.outputs.changed }}
       base_matrix: ${{ steps.platforms.outputs.base_matrix }}
       uv_matrix: ${{ steps.platforms.outputs.uv_matrix }}
@@ -34,6 +35,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Stable's VERSION_ID (e.g. "3.24.1") is used as-is for tagging. Edge's
+      # (e.g. "3.25.0_alpha20260805") is trimmed down to just the trailing
+      # snapshot date, matching how the upstream alpine image itself tags
+      # edge builds (e.g. "20260805") rather than publishing the full
+      # version string as a tag.
       - name: Resolve version
         id: version
         run: |
@@ -42,6 +48,7 @@ jobs:
           docker pull "$image"
           version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag_value=${version##*alpha}" >> "$GITHUB_OUTPUT"
 
       # Alpine doesn't cut a new release every day, so a plain daily cron
       # would rebuild and republish identical content most days. On a
@@ -159,7 +166,7 @@ jobs:
 
   assemble-base:
     name: Assemble base in GHCR
-    needs: build-base
+    needs: [build-base, resolve-version-base]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -185,7 +192,9 @@ jobs:
 
       - name: Resolve tags
         id: tags
-        run: echo "list=$BASE_TAG" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ needs.resolve-version-base.outputs.tag_version }}
+        run: echo "list=$BASE_TAG $VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest
         env:
@@ -246,6 +255,7 @@ jobs:
       packages: read
     outputs:
       version: ${{ steps.version.outputs.value }}
+      tag_version: ${{ steps.version.outputs.tag_value }}
     steps:
       - uses: actions/checkout@v7
 
@@ -264,6 +274,7 @@ jobs:
           docker pull "$image"
           version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
           echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag_value=${version##*alpha}" >> "$GITHUB_OUTPUT"
 
   build-python:
     name: Build python (${{ matrix.platform }})
@@ -325,7 +336,7 @@ jobs:
 
   assemble-python:
     name: Assemble python in GHCR
-    needs: build-python
+    needs: [build-python, resolve-version-python]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -351,7 +362,9 @@ jobs:
 
       - name: Resolve tags
         id: tags
-        run: echo "list=$PYTHON_TAG" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ needs.resolve-version-python.outputs.tag_version }}
+        run: echo "list=$PYTHON_TAG $VERSION-$PYTHON_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest
         env:
