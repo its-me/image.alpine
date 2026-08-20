@@ -1,0 +1,40 @@
+ARG PYTHON_TAG=python
+FROM ghcr.io/its-me/alpine:${PYTHON_TAG}
+
+ARG PYTHON_TAG
+ARG VERSION
+ARG UV_VERSION
+ARG TARGETARCH
+ARG TARGETVARIANT
+LABEL org.opencontainers.image.version=$VERSION
+LABEL org.opencontainers.image.source=https://github.com/its-me/image.alpine
+LABEL org.opencontainers.image.title="alpine-uv"
+LABEL org.opencontainers.image.description="Extends the alpine-python image with uv, installed from the official prebuilt musl release binary"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.authors="Sergey Kanafyev <sergeykanafyev@gmail.com>"
+LABEL org.opencontainers.image.base.name="ghcr.io/its-me/alpine:${PYTHON_TAG}"
+
+# uv publishes prebuilt musl binaries for every platform built here, so unlike
+# glibc-based distros there's no need to compile from source on any of them.
+RUN apk add --no-cache curl && \
+    set -eu; \
+    case "${TARGETARCH}-${TARGETVARIANT}" in \
+        amd64-)   asset=x86_64-unknown-linux-musl ;; \
+        arm64-)   asset=aarch64-unknown-linux-musl ;; \
+        arm-v7)   asset=armv7-unknown-linux-musleabihf ;; \
+        arm-v6)   asset=arm-unknown-linux-musleabihf ;; \
+        386-)     asset=i686-unknown-linux-musl ;; \
+        riscv64-) asset=riscv64gc-unknown-linux-musl ;; \
+        *) echo "unsupported platform: TARGETARCH=$TARGETARCH TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${asset}.tar.gz" \
+        -o /tmp/uv.tar.gz && \
+    mkdir -p /tmp/uv-bin && tar -xzf /tmp/uv.tar.gz -C /tmp/uv-bin --strip-components=1 && \
+    mv /tmp/uv-bin/uv /usr/local/bin/uv && \
+    rm -rf /tmp/uv.tar.gz /tmp/uv-bin && \
+    apk del curl
+
+RUN uv --version
+
+CMD ["uv"]

@@ -1,0 +1,591 @@
+name: edge
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  REPOSITORY: alpine
+  VARIANT: edge
+  BASE_TAG: edge
+  PYTHON_TAG: edge-python
+  UV_TAG: edge-uv
+
+jobs:
+  resolve-version-base:
+    name: Resolve base version and platforms
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      changed: ${{ steps.check.outputs.changed }}
+      base_matrix: ${{ steps.platforms.outputs.base_matrix }}
+      uv_matrix: ${{ steps.platforms.outputs.uv_matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          template=$(awk '$1=="FROM"{img=$2} END{print img}' Dockerfile)
+          image=${template//\$\{VARIANT\}/$VARIANT}
+          docker pull "$image"
+          version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      # Alpine doesn't cut a new release every day, so a plain daily cron
+      # would rebuild and republish identical content most days. On a
+      # schedule trigger, compare the resolved version against what's
+      # already published in GHCR and skip the rest of the workflow if
+      # nothing changed. Push/dispatch triggers always rebuild, since those
+      # are explicit requests (e.g. after editing a Dockerfile) that a bare
+      # version comparison wouldn't catch.
+      - name: Check for new version
+        id: check
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.value }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          current=$(docker buildx imagetools inspect "ghcr.io/its-me/$REPOSITORY:$BASE_TAG" --format '{{json .}}' 2>/dev/null \
+            | jq -r '.image | to_entries[0].value.config.Labels["org.opencontainers.image.version"] // empty') || current=""
+          if [ "$current" = "$NEW_VERSION" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # alpine:${VARIANT}'s published platforms could shift over time, so the
+      # matrix is resolved from the upstream manifest instead of hardcoded.
+      # The uv matrix additionally drops linux/ppc64le (uv publishes no build
+      # for it at all) and linux/s390x (uv only publishes a glibc build,
+      # unusable on musl-based Alpine).
+      - name: Resolve platforms
+        if: steps.check.outputs.changed == 'true'
+        id: platforms
+        run: |
+          set -eu
+          known='[
+            {"platform":"linux/amd64",   "runner":"ubuntu-latest",    "qemu":false, "arch":"amd64",   "variant":null},
+            {"platform":"linux/arm64",   "runner":"ubuntu-24.04-arm", "qemu":false, "arch":"arm64",   "variant":"v8"},
+            {"platform":"linux/arm/v7",  "runner":"ubuntu-24.04-arm", "qemu":true,  "arch":"arm",     "variant":"v7"},
+            {"platform":"linux/arm/v6",  "runner":"ubuntu-24.04-arm", "qemu":true,  "arch":"arm",     "variant":"v6"},
+            {"platform":"linux/386",     "runner":"ubuntu-latest",    "qemu":true,  "arch":"386",     "variant":null},
+            {"platform":"linux/ppc64le", "runner":"ubuntu-latest",    "qemu":true,  "arch":"ppc64le", "variant":null},
+            {"platform":"linux/riscv64", "runner":"ubuntu-latest",    "qemu":true,  "arch":"riscv64", "variant":null},
+            {"platform":"linux/s390x",   "runner":"ubuntu-latest",    "qemu":true,  "arch":"s390x",   "variant":null}
+          ]'
+
+          available=$(docker buildx imagetools inspect "alpine:${VARIANT}" --raw \
+            | jq -c '[.manifests[].platform | select(.os == "linux") | {arch: .architecture, variant: (.variant // null)}]')
+
+          base=$(jq -nc --argjson known "$known" --argjson avail "$available" \
+            '{include: [$known[] | select(. as $k | $avail | any(.arch == $k.arch and .variant == $k.variant)) | {platform, runner, qemu}]}')
+          uv=$(jq -c '.include |= map(select(.platform != "linux/ppc64le" and .platform != "linux/s390x"))' <<<"$base")
+
+          echo "base_matrix=$base" >> "$GITHUB_OUTPUT"
+          echo "uv_matrix=$uv" >> "$GITHUB_OUTPUT"
+
+  build-base:
+    name: Build base (${{ matrix.platform }})
+    needs: resolve-version-base
+    if: needs.resolve-version-base.outputs.changed == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.resolve-version-base.outputs.base_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VARIANT=${{ env.VARIANT }}
+            VERSION=${{ needs.resolve-version-base.outputs.version }}
+          outputs: type=image,name=ghcr.io/its-me/${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> $GITHUB_ENV
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: base-digest-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble-base:
+    name: Assemble base in GHCR
+    needs: build-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: base-digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve tags
+        id: tags
+        run: echo "list=$BASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          for tag in $TAGS; do
+            docker buildx imagetools create \
+              --tag ghcr.io/its-me/$REPOSITORY:$tag \
+              $(printf "ghcr.io/its-me/$REPOSITORY@sha256:%s " $(ls /tmp/digests))
+          done
+
+  push-base-hub:
+    name: Deploy base to Docker Hub
+    needs: assemble-base
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: ${{ secrets.HUB_USERNAME }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.HUB_USERNAME }}
+          destination-password: ${{ secrets.HUB_TOKEN }}
+          tags: ${{ needs.assemble-base.outputs.tags }}
+
+  push-base-quay:
+    name: Deploy base to Quay.io
+    needs: assemble-base
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - name: Resolve Quay namespace
+        id: namespace
+        env:
+          QUAY_NAMESPACE: ${{ secrets.QUAY_USERNAME }}
+        run: echo "value=${QUAY_NAMESPACE%%+*}" >> "$GITHUB_OUTPUT"
+
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: quay.io/${{ steps.namespace.outputs.value }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.QUAY_USERNAME }}
+          destination-password: ${{ secrets.QUAY_TOKEN }}
+          tags: ${{ needs.assemble-base.outputs.tags }}
+
+  resolve-version-python:
+    name: Resolve python version
+    needs: assemble-base
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          template=$(awk '$1=="FROM"{img=$2} END{print img}' Dockerfile.python)
+          image=${template//\$\{BASE_TAG\}/$BASE_TAG}
+          docker pull "$image"
+          version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  build-python:
+    name: Build python (${{ matrix.platform }})
+    needs: [resolve-version-python, resolve-version-base]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.resolve-version-base.outputs.base_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.python
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BASE_TAG=${{ env.BASE_TAG }}
+            VERSION=${{ needs.resolve-version-python.outputs.version }}
+          outputs: type=image,name=ghcr.io/its-me/${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> $GITHUB_ENV
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-digest-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble-python:
+    name: Assemble python in GHCR
+    needs: build-python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: python-digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve tags
+        id: tags
+        run: echo "list=$PYTHON_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          for tag in $TAGS; do
+            docker buildx imagetools create \
+              --tag ghcr.io/its-me/$REPOSITORY:$tag \
+              $(printf "ghcr.io/its-me/$REPOSITORY@sha256:%s " $(ls /tmp/digests))
+          done
+
+  push-python-hub:
+    name: Deploy python to Docker Hub
+    needs: assemble-python
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: ${{ secrets.HUB_USERNAME }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.HUB_USERNAME }}
+          destination-password: ${{ secrets.HUB_TOKEN }}
+          tags: ${{ needs.assemble-python.outputs.tags }}
+
+  push-python-quay:
+    name: Deploy python to Quay.io
+    needs: assemble-python
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - name: Resolve Quay namespace
+        id: namespace
+        env:
+          QUAY_NAMESPACE: ${{ secrets.QUAY_USERNAME }}
+        run: echo "value=${QUAY_NAMESPACE%%+*}" >> "$GITHUB_OUTPUT"
+
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: quay.io/${{ steps.namespace.outputs.value }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.QUAY_USERNAME }}
+          destination-password: ${{ secrets.QUAY_TOKEN }}
+          tags: ${{ needs.assemble-python.outputs.tags }}
+
+  resolve-version-uv:
+    name: Resolve uv version
+    needs: assemble-python
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      uv_version: ${{ steps.uv-release.outputs.value }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolved once here and passed as a build-arg to every matrix build, so
+      # all architectures build the exact same uv release instead of each of
+      # the per-arch builds independently (and possibly inconsistently)
+      # resolving "latest" on its own.
+      - name: Resolve uv release
+        id: uv-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/astral-sh/uv/releases/latest --jq .tag_name)
+          if [ -z "$tag" ]; then
+            echo "::error::failed to resolve uv release tag" >&2
+            exit 1
+          fi
+          echo "value=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version
+        id: version
+        run: |
+          template=$(awk '$1=="FROM"{img=$2} END{print img}' Dockerfile.uv)
+          image=${template//\$\{PYTHON_TAG\}/$PYTHON_TAG}
+          docker pull "$image"
+          version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  build-uv:
+    name: Build uv (${{ matrix.platform }})
+    needs: [resolve-version-uv, resolve-version-base]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix: ${{ fromJson(needs.resolve-version-base.outputs.uv_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.uv
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BASE_TAG=${{ env.BASE_TAG }}
+            PYTHON_TAG=${{ env.PYTHON_TAG }}
+            VERSION=${{ needs.resolve-version-uv.outputs.version }}
+            UV_VERSION=${{ needs.resolve-version-uv.outputs.uv_version }}
+          outputs: type=image,name=ghcr.io/its-me/${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> $GITHUB_ENV
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: uv-digest-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble-uv:
+    name: Assemble uv in GHCR
+    needs: [build-uv, resolve-version-uv]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.tags.outputs.list }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: uv-digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Resolve tags
+        id: tags
+        env:
+          UV_VERSION: ${{ needs.resolve-version-uv.outputs.uv_version }}
+        run: echo "list=$UV_TAG $UV_TAG-$UV_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          for tag in $TAGS; do
+            docker buildx imagetools create \
+              --tag ghcr.io/its-me/$REPOSITORY:$tag \
+              $(printf "ghcr.io/its-me/$REPOSITORY@sha256:%s " $(ls /tmp/digests))
+          done
+
+  push-uv-hub:
+    name: Deploy uv to Docker Hub
+    needs: assemble-uv
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: ${{ secrets.HUB_USERNAME }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.HUB_USERNAME }}
+          destination-password: ${{ secrets.HUB_TOKEN }}
+          tags: ${{ needs.assemble-uv.outputs.tags }}
+
+  push-uv-quay:
+    name: Deploy uv to Quay.io
+    needs: assemble-uv
+    runs-on: ubuntu-slim
+    permissions:
+      packages: read
+    steps:
+      - name: Resolve Quay namespace
+        id: namespace
+        env:
+          QUAY_NAMESPACE: ${{ secrets.QUAY_USERNAME }}
+        run: echo "value=${QUAY_NAMESPACE%%+*}" >> "$GITHUB_OUTPUT"
+
+      - uses: its-me/action.image.mirror@v1
+        with:
+          source: ghcr.io/its-me/${{ env.REPOSITORY }}
+          source-username: ${{ github.actor }}
+          source-password: ${{ secrets.GITHUB_TOKEN }}
+          destination: quay.io/${{ steps.namespace.outputs.value }}/${{ env.REPOSITORY }}
+          destination-username: ${{ secrets.QUAY_USERNAME }}
+          destination-password: ${{ secrets.QUAY_TOKEN }}
+          tags: ${{ needs.assemble-uv.outputs.tags }}

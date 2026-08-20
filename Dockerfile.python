@@ -1,0 +1,18 @@
+ARG BASE_TAG=latest
+FROM ghcr.io/its-me/alpine:${BASE_TAG}
+
+ARG BASE_TAG
+ARG VERSION
+LABEL org.opencontainers.image.version=$VERSION
+LABEL org.opencontainers.image.source=https://github.com/its-me/image.alpine
+LABEL org.opencontainers.image.title="alpine-python"
+LABEL org.opencontainers.image.description="Extends the alpine base image with python3 and pip"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.authors="Sergey Kanafyev <sergeykanafyev@gmail.com>"
+LABEL org.opencontainers.image.base.name="ghcr.io/its-me/alpine:${BASE_TAG}"
+
+RUN apk add --no-cache python3 py3-pip
+
+RUN python3 --version
+
+CMD ["python3"]
