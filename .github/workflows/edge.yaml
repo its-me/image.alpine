@@ -115,6 +115,7 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.resolve-version-base.outputs.base_matrix) }}
     steps:
       - uses: actions/checkout@v7
@@ -284,6 +285,7 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.resolve-version-base.outputs.base_matrix) }}
     steps:
       - uses: actions/checkout@v7
@@ -469,6 +471,7 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.resolve-version-base.outputs.uv_matrix) }}
     steps:
       - uses: actions/checkout@v7
