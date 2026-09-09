@@ -79,9 +79,10 @@ jobs:
       # matrix is resolved from the upstream manifest instead of hardcoded.
       # The uv matrix additionally drops linux/ppc64le (uv publishes no build
       # for it at all) and linux/s390x (uv only publishes a glibc build,
-      # unusable on musl-based Alpine).
+      # unusable on musl-based Alpine). Always runs, even when the base image
+      # is unchanged, since the uv tier's own build gate (further down) needs
+      # uv_matrix regardless of whether base rebuilds today.
       - name: Resolve platforms
-        if: steps.check.outputs.changed == 'true'
         id: platforms
         run: |
           set -eu
@@ -420,7 +421,11 @@ jobs:
 
   resolve-version-uv:
     name: Resolve uv version
-    needs: assemble-python
+    # Deliberately not gated behind assemble-python/build-base: uv cuts
+    # releases far more often than Alpine does, so this job (and its own
+    # changed check below) must run every day regardless of whether the base
+    # or python tiers rebuilt today. It only needs the already-published
+    # PYTHON_TAG image to exist, which it always does from a prior run.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -428,6 +433,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
       uv_version: ${{ steps.uv-release.outputs.value }}
+      changed: ${{ steps.check.outputs.changed }}
     steps:
       - uses: actions/checkout@v7
 
@@ -463,9 +469,31 @@ jobs:
           version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
+      # uv releases far more often than Alpine does, so this is checked
+      # independently of the base tier's own version check: skip only if this
+      # exact uv release has already been published under this tag, so a
+      # schedule run that finds nothing new doesn't republish identical
+      # content. Push/dispatch triggers always rebuild, matching base's check.
+      - name: Check for new uv version
+        id: check
+        env:
+          UV_VERSION: ${{ steps.uv-release.outputs.value }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if docker buildx imagetools inspect "ghcr.io/its-me/$REPOSITORY:$UV_TAG-$UV_VERSION" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-uv:
     name: Build uv (${{ matrix.platform }})
     needs: [resolve-version-uv, resolve-version-base]
+    if: needs.resolve-version-uv.outputs.changed == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
