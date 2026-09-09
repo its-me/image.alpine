@@ -109,8 +109,10 @@ jobs:
 
   build-base:
     name: Build base (${{ matrix.platform }})
-    needs: resolve-version-base
-    if: needs.resolve-version-base.outputs.changed == 'true'
+    # Also rebuilds on a bare uv bump (base itself unchanged), so all three
+    # tiers stay version-synced instead of uv racing ahead of a stale base.
+    needs: [resolve-version-base, resolve-version-uv]
+    if: needs.resolve-version-base.outputs.changed == 'true' || needs.resolve-version-uv.outputs.changed == 'true'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -492,8 +494,11 @@ jobs:
 
   build-uv:
     name: Build uv (${{ matrix.platform }})
-    needs: [resolve-version-uv, resolve-version-base]
-    if: needs.resolve-version-uv.outputs.changed == 'true'
+    # No explicit changed check needed here: assemble-python only completes
+    # when build-base ran (base changed OR uv changed, see build-base above),
+    # so this job already only runs in exactly those same cases, and always
+    # builds against a freshly rebuilt python image rather than racing it.
+    needs: [resolve-version-uv, resolve-version-base, assemble-python]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
