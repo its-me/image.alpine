@@ -22,7 +22,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
       tag_version: ${{ steps.version.outputs.tag_value }}
-      changed: ${{ steps.check.outputs.changed }}
       base_matrix: ${{ steps.platforms.outputs.base_matrix }}
       uv_matrix: ${{ steps.platforms.outputs.uv_matrix }}
     steps:
@@ -50,38 +49,11 @@ jobs:
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "tag_value=${version##*alpha}" >> "$GITHUB_OUTPUT"
 
-      # Alpine doesn't cut a new release every day, so a plain daily cron
-      # would rebuild and republish identical content most days. On a
-      # schedule trigger, compare the resolved version against what's
-      # already published in GHCR and skip the rest of the workflow if
-      # nothing changed. Push/dispatch triggers always rebuild, since those
-      # are explicit requests (e.g. after editing a Dockerfile) that a bare
-      # version comparison wouldn't catch.
-      - name: Check for new version
-        id: check
-        env:
-          NEW_VERSION: ${{ steps.version.outputs.value }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" != "schedule" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          current=$(docker buildx imagetools inspect "ghcr.io/its-me/$REPOSITORY:$BASE_TAG" --format '{{json .}}' 2>/dev/null \
-            | jq -r '.image | to_entries[0].value.config.Labels["org.opencontainers.image.version"] // empty') || current=""
-          if [ "$current" = "$NEW_VERSION" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
       # alpine:${VARIANT}'s published platforms could shift over time, so the
       # matrix is resolved from the upstream manifest instead of hardcoded.
       # The uv matrix additionally drops linux/ppc64le (uv publishes no build
       # for it at all) and linux/s390x (uv only publishes a glibc build,
-      # unusable on musl-based Alpine). Always runs, even when the base image
-      # is unchanged, since the uv tier's own build gate (further down) needs
-      # uv_matrix regardless of whether base rebuilds today.
+      # unusable on musl-based Alpine).
       - name: Resolve platforms
         id: platforms
         run: |
@@ -109,10 +81,7 @@ jobs:
 
   build-base:
     name: Build base (${{ matrix.platform }})
-    # Also rebuilds on a bare uv bump (base itself unchanged), so all three
-    # tiers stay version-synced instead of uv racing ahead of a stale base.
-    needs: [resolve-version-base, resolve-version-uv]
-    if: needs.resolve-version-base.outputs.changed == 'true' || needs.resolve-version-uv.outputs.changed == 'true'
+    needs: resolve-version-base
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -423,11 +392,7 @@ jobs:
 
   resolve-version-uv:
     name: Resolve uv version
-    # Deliberately not gated behind assemble-python/build-base: uv cuts
-    # releases far more often than Alpine does, so this job (and its own
-    # changed check below) must run every day regardless of whether the base
-    # or python tiers rebuilt today. It only needs the already-published
-    # PYTHON_TAG image to exist, which it always does from a prior run.
+    needs: assemble-python
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -435,7 +400,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
       uv_version: ${{ steps.uv-release.outputs.value }}
-      changed: ${{ steps.check.outputs.changed }}
     steps:
       - uses: actions/checkout@v7
 
@@ -471,34 +435,9 @@ jobs:
           version=$(docker run --rm "$image" sh -c '. /etc/os-release && echo "$VERSION_ID"')
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      # uv releases far more often than Alpine does, so this is checked
-      # independently of the base tier's own version check: skip only if this
-      # exact uv release has already been published under this tag, so a
-      # schedule run that finds nothing new doesn't republish identical
-      # content. Push/dispatch triggers always rebuild, matching base's check.
-      - name: Check for new uv version
-        id: check
-        env:
-          UV_VERSION: ${{ steps.uv-release.outputs.value }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" != "schedule" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if docker buildx imagetools inspect "ghcr.io/its-me/$REPOSITORY:$UV_TAG-$UV_VERSION" >/dev/null 2>&1; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
   build-uv:
     name: Build uv (${{ matrix.platform }})
-    # No explicit changed check needed here: assemble-python only completes
-    # when build-base ran (base changed OR uv changed, see build-base above),
-    # so this job already only runs in exactly those same cases, and always
-    # builds against a freshly rebuilt python image rather than racing it.
-    needs: [resolve-version-uv, resolve-version-base, assemble-python]
+    needs: [resolve-version-uv, resolve-version-base]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
